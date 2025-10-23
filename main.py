@@ -11,6 +11,9 @@ from datetime import datetime
 import json
 import pandas as pd
 import time
+import io
+import zipfile
+from typing import Optional
 
 # 환경 변수 로드
 load_dotenv()
@@ -41,10 +44,7 @@ def initialize_session_state():
         st.session_state.cumulative_api_usage = load_cumulative_api_usage()
     if 'last_usage_save_time' not in st.session_state:
         st.session_state.last_usage_save_time = time.time()
-    if 'api_key_status' not in st.session_state:
-        # 앱 시작 시 API 키 유효성 검사 (세션당 1회)
-        st.session_state.api_key_status = check_api_key_validity()
-
+    # 앱 시작 시 API 키 유효성 검사를 제거하여 초기 로딩 속도 개선
     
     # 기존 소설 목록 로드
     if not st.session_state.novels:
@@ -162,16 +162,6 @@ def main():
 
 def render_sidebar():
     """사이드바 렌더링"""
-    # API 키 상태 표시
-    api_status = st.session_state.get('api_key_status', {})
-    if api_status.get('valid'):
-        st.sidebar.success("✅ API 키가 활성화되었습니다.", icon="🔑")
-    else:
-        st.sidebar.error(f"❌ {api_status.get('message', 'API 키 확인 필요')}", icon="🔑")
-        if st.sidebar.button("문제 해결 가이드 보기"):
-            st.session_state.page = "troubleshoot"
-            st.rerun()
-
     with st.sidebar:
         st.header("메뉴")
         
@@ -805,12 +795,70 @@ def render_novel_detail_screen():
     
     with tab2: # 2. 등장인물 탭
         st.subheader("등장인물 관리")
+
+        # --- AI로 등장인물 추출 기능 ---
+        with st.expander("🤖 AI로 등장인물 추출 (대본 분석)"):
+            st.markdown("#### 대본을 분석하여 등장인물을 자동으로 찾아냅니다.")
+            
+            # 기존 등장인물이 있을 경우, 처리 방식 선택 옵션 제공
+            if novel.characters:
+                st.warning("⚠️ 이미 추출된 등장인물이 있습니다. 어떻게 처리할까요?")
+                extraction_mode = st.radio(
+                    "추출 방식 선택",
+                    ("기존 목록에 새로운 인물만 추가", "기존 목록을 모두 지우고 새로 추출"),
+                    key=f"char_extract_mode_{novel.id}",
+                    horizontal=True,
+                    label_visibility="collapsed"
+                )
+            else:
+                extraction_mode = "기존 목록에 새로운 인물만 추가" # 기본값
+
+            if st.button("✅ 추출 실행", key=f"run_extract_chars_{novel.id}", use_container_width=True):
+                # extraction_mode에 따라 'replace' 플래그 설정
+                replace = (extraction_mode == "기존 목록을 모두 지우고 새로 추출")
+                extract_characters_from_novel(novel, replace=replace)
+            
+            st.caption("AI가 대본 전체를 분석하여 이름과 특징을 추출합니다. 대본이 길 경우 시간이 소요될 수 있습니다.")
+
+        st.markdown("---")
+
+        # --- 새 등장인물 수동 추가 기능 ---
+        with st.expander("➕ 새 등장인물 수동 추가"):
+            with st.form(key=f"add_character_form_{novel.id}", clear_on_submit=True):
+                st.markdown("#### 새로운 등장인물 정보 입력")
+                new_char_name = st.text_input("이름", placeholder="예: 김민준")
+                new_char_desc = st.text_area(
+                    "외모 및 특징 묘사", 
+                    placeholder="예: 30대 초반의 남성. 날카로운 눈매와 다부진 체격을 가졌다. 주로 어두운 색의 정장을 입는다.",
+                    height=150
+                )
+                submitted = st.form_submit_button("✅ 등장인물 추가", use_container_width=True)
+
+                if submitted:
+                    if new_char_name.strip() and new_char_desc.strip():
+                        new_character = Character(
+                            id=generate_uuid(),
+                            novel_id=novel.id,
+                            name=new_char_name.strip(),
+                            description=new_char_desc.strip(),
+                            reference_image_url="",
+                            created_at=datetime.now()
+                        )
+                        novel.characters[new_character.id] = new_character
+                        save_novel_and_update_session(novel, f"등장인물 '{new_character.name}'이(가) 추가되었습니다.")
+                    else:
+                        st.warning("이름과 설명을 모두 입력해주세요.")
+        
+        st.markdown("---")
+
+        # --- 기존 등장인물 관리 UI ---
+
         if novel.characters:
             # 이름순으로 정렬하여 일관된 순서 유지
             sorted_characters = sorted(novel.characters.items(), key=lambda item: item[1].name)
             for char_id, character in sorted_characters:
                 with st.expander(f"👤 {character.name}"):
-                    edit_desc_key = f"edit_desc_{character.id}"
+                    edit_desc_key = f"edit_desc_{character.id}" # 이 부분은 변경 없음
 
                     if st.session_state.get(edit_desc_key, False):
                         # --- 설명 편집 모드 ---
@@ -825,15 +873,7 @@ def render_novel_detail_screen():
                         with col1:
                             if st.button("💾 저장", key=f"save_desc_{character.id}", use_container_width=True):
                                 character.description = new_description
-                                data_manager = st.session_state.data_manager
-                                if data_manager.save_novel(novel):
-                                    st.session_state.novels[novel.id] = novel
-                                    data_manager.save_novels(st.session_state.novels)
-                                    st.success(f"'{character.name}'의 설명이 저장되었습니다.")
-                                    st.session_state[edit_desc_key] = False
-                                    st.rerun()
-                                else:
-                                    st.error("설명 저장에 실패했습니다.")
+                                save_novel_and_update_session(novel, f"'{character.name}'의 설명이 저장되었습니다.", edit_desc_key)
                         with col2:
                             if st.button("❌ 취소", key=f"cancel_desc_{character.id}", use_container_width=True):
                                 st.session_state[edit_desc_key] = False
@@ -917,9 +957,45 @@ def render_novel_detail_screen():
                         except Exception as e:
                             st.error(f"이미지 로딩 오류: {str(e)}")
         else:
-            st.info("등장인물이 없습니다.")
-            if st.button("🤖 AI로 등장인물 추출하기", use_container_width=True, key="extract_chars_tab2"):
-                extract_characters_from_novel(novel)
+            st.info("현재 소설에 등장인물이 없습니다. 위 'AI로 등장인물 추출' 또는 '새 등장인물 수동 추가' 기능을 사용해 캐릭터를 추가해주세요.")
+            # if st.button("🤖 AI로 등장인물 추출하기", use_container_width=True, key="extract_chars_tab2"):
+            #     extract_characters_from_novel(novel)
+            # -> 위에서 상시 버튼으로 변경했으므로 이 부분은 제거
+        
+        st.markdown("---")
+        # --- 이미지 일괄 다운로드 기능 (화면 하단으로 이동) ---
+        with st.container(border=True):
+            st.markdown("#### 📦 모든 등장인물 이미지 일괄 다운로드")
+            st.caption("이 소설의 모든 등장인물 이미지를 하나의 압축(ZIP) 파일로 다운로드합니다.")
+            
+            zip_key = f"character_zip_data_{novel.id}"
+
+            if st.button("압축 파일 생성 및 다운로드 준비", use_container_width=True, key=f"prepare_zip_{novel.id}"):
+                with st.spinner("이미지 압축 파일을 생성 중입니다..."):
+                    zip_data = create_character_images_zip(novel)
+                    if zip_data:
+                        st.session_state[zip_key] = zip_data
+                        st.success("압축 파일 생성이 완료되었습니다. 아래 버튼으로 다운로드하세요.")
+                    else:
+                        # create_character_images_zip 함수 내에서 오류 메시지를 이미 표시함
+                        pass
+            
+            if zip_key in st.session_state and st.session_state[zip_key]:
+                import re
+                # 파일명으로 사용할 수 없는 문자 제거
+                sanitized_novel_title = re.sub(r'[\\/*?:"<>|]', "", novel.title)
+                download_filename = f"{sanitized_novel_title}_등장인물.zip"
+                
+                st.download_button(
+                    label="📥 다운로드 시작",
+                    data=st.session_state[zip_key],
+                    file_name=download_filename,
+                    mime="application/zip",
+                    use_container_width=True,
+                    on_click=lambda: st.session_state.pop(zip_key, None) # 다운로드 후 세션에서 데이터 제거
+                )
+
+
 
     with tab3: # 3. 장 관리 탭
         st.subheader("장(Chapter) 관리") 
@@ -1387,6 +1463,42 @@ def render_novel_detail_screen():
             else:
                 st.markdown("### 💡 장면 분리 방법")
                 st.info("먼저 '📚 장 관리' 탭에서 대본을 장으로 분리한 후, 각 장을 개별적으로 장면으로 분리하는 것을 권장합니다.")
+        
+        st.markdown("---")
+        # --- 장면 이미지 일괄 다운로드 기능 ---
+        with st.container(border=True):
+            st.markdown("#### 📦 모든 장면 이미지 일괄 다운로드")
+            st.caption("이 소설의 모든 장면 이미지를 하나의 압축(ZIP) 파일로 다운로드합니다.")
+            
+            zip_key = f"scene_zip_data_{novel.id}"
+
+            if st.button("압축 파일 생성 및 다운로드 준비", use_container_width=True, key=f"prepare_scene_zip_{novel.id}"):
+                with st.spinner("장면 이미지 압축 파일을 생성 중입니다..."):
+                    zip_data = create_scene_images_zip(novel)
+                    if zip_data:
+                        st.session_state[zip_key] = zip_data
+                        st.success("압축 파일 생성이 완료되었습니다. 아래 버튼으로 다운로드하세요.")
+                    else:
+                        # create_scene_images_zip 함수 내에서 오류 메시지를 이미 표시함
+                        pass
+            
+            if zip_key in st.session_state and st.session_state[zip_key]:
+                import re
+                # 파일명으로 사용할 수 없는 문자 제거
+                sanitized_novel_title = re.sub(r'[\\/*?:"<>|]', "", novel.title)
+                download_filename = f"{sanitized_novel_title}_장면.zip"
+                
+                st.download_button(
+                    label="📥 다운로드 시작",
+                    data=st.session_state[zip_key],
+                    file_name=download_filename,
+                    mime="application/zip",
+                    use_container_width=True,
+                    on_click=lambda: st.session_state.pop(zip_key, None) # 다운로드 후 세션에서 데이터 제거
+                )
+
+
+
     
     with tab5: # 5. AI 분석 탭
         st.subheader("AI 분석 및 생성")
@@ -1557,7 +1669,97 @@ def render_novel_detail_screen():
             run_full_automation(novel)
 
 
-def extract_characters_from_novel(novel: Novel):
+def save_novel_and_update_session(novel: Novel, success_message: str, session_key_to_clear: Optional[str] = None):
+    """소설 데이터를 저장하고 세션 상태를 업데이트하는 헬퍼 함수"""
+    data_manager = st.session_state.data_manager
+    if data_manager.save_novel(novel):
+        st.session_state.novels[novel.id] = novel
+        if data_manager.save_novels(st.session_state.novels):
+            st.success(success_message)
+            if session_key_to_clear and session_key_to_clear in st.session_state:
+                del st.session_state[session_key_to_clear]
+            st.rerun()
+        else:
+            st.error("소설 메타데이터 저장에 실패했습니다.")
+    else:
+        st.error("소설 상세 데이터 저장에 실패했습니다.")
+
+
+def create_character_images_zip(novel: Novel) -> Optional[bytes]:
+    """소설의 모든 등장인물 이미지를 포함하는 ZIP 파일을 메모리에서 생성합니다."""
+    data_manager = st.session_state.data_manager
+    
+    characters_with_images = [char for char in novel.characters.values() if char.reference_image_url]
+    
+    if not characters_with_images:
+        st.warning("다운로드할 이미지가 있는 등장인물이 없습니다.")
+        return None
+
+    zip_buffer = io.BytesIO()
+    # ZIP 파일 생성
+    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+        for character in characters_with_images:
+            try:
+                image_data = data_manager.load_image(character.reference_image_url)
+                if image_data:
+                    # 파일명으로 사용할 수 없는 문자 제거
+                    import re
+                    sanitized_name = re.sub(r'[\\/*?:"<>|]', "", character.name)
+                    filename = f"{sanitized_name}.png"
+                    
+                    # ZIP 파일에 이미지 추가
+                    zip_file.writestr(filename, image_data)
+            except Exception as e:
+                st.error(f"'{character.name}'의 이미지를 압축하는 중 오류 발생: {e}")
+    
+    zip_buffer.seek(0)
+    return zip_buffer.getvalue()
+
+def create_scene_images_zip(novel: Novel) -> Optional[bytes]:
+    """소설의 모든 장면 이미지를 포함하는 ZIP 파일을 메모리에서 생성합니다."""
+    data_manager = st.session_state.data_manager
+    
+    scenes_with_images = [scene for scene in novel.scenes.values() if scene.image_url]
+    
+    if not scenes_with_images:
+        st.warning("다운로드할 이미지가 있는 장면이 없습니다.")
+        return None
+
+    zip_buffer = io.BytesIO()
+    # ZIP 파일 생성
+    with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zip_file:
+        # 장면을 챕터 번호와 제목으로 정렬
+        def get_scene_sort_key(scene):
+            chapter_number = 0
+            if scene.chapter_id and scene.chapter_id in novel.chapters:
+                chapter_number = novel.chapters[scene.chapter_id].chapter_number
+            return (chapter_number, scene.title)
+
+        sorted_scenes = sorted(scenes_with_images, key=get_scene_sort_key)
+
+        for scene in sorted_scenes:
+            try:
+                image_data = data_manager.load_image(scene.image_url)
+                if image_data:
+                    import re
+                    sanitized_title = re.sub(r'[\\/*?:"<>|]', "", scene.title)
+                    
+                    # 파일명에 챕터 번호 추가
+                    chapter_prefix = ""
+                    if scene.chapter_id and scene.chapter_id in novel.chapters:
+                        chapter_number = novel.chapters[scene.chapter_id].chapter_number
+                        chapter_prefix = f"{chapter_number:02d}장_"
+
+                    filename = f"{chapter_prefix}{sanitized_title}.png"
+                    
+                    zip_file.writestr(filename, image_data)
+            except Exception as e:
+                st.error(f"'{scene.title}'의 이미지를 압축하는 중 오류 발생: {e}")
+    
+    zip_buffer.seek(0)
+    return zip_buffer.getvalue()
+
+def extract_characters_from_novel(novel: Novel, replace: bool = False):
     """소설에서 등장인물 추출"""
     try:
         from src.api_clients import GeminiClient
@@ -1565,10 +1767,21 @@ def extract_characters_from_novel(novel: Novel):
         with st.spinner("🤖 AI가 등장인물을 추출하고 있습니다..."):
             gemini_client = GeminiClient()
             character_data = gemini_client.extract_characters_from_script(novel.script)
-            
+
             if character_data:
+                newly_added_count = 0
+                
+                # 기존 목록을 지우고 새로 시작하는 경우
+                if replace:
+                    novel.characters = {}
+                    st.info("기존 등장인물 목록을 초기화했습니다.")
+
                 # 등장인물 객체 생성
-                for char_info in character_data:                    
+                for char_info in character_data:
+                    # 이름으로 중복 확인
+                    if any(c.name == char_info['name'] for c in novel.characters.values()):
+                        continue # 이미 존재하면 건너뛰기
+
                     character = Character(
                         id=generate_uuid(),
                         novel_id=novel.id,
@@ -1578,15 +1791,19 @@ def extract_characters_from_novel(novel: Novel):
                         created_at=datetime.now()
                     )
                     novel.characters[character.id] = character
+                    newly_added_count += 1
                 
                 # 데이터 저장
                 data_manager = st.session_state.data_manager
                 data_manager.save_novel(novel)
                 st.session_state.novels[novel.id] = novel
                 data_manager.save_novels(st.session_state.novels)
-                
-                st.success(f"✅ {len(character_data)}명의 등장인물이 추출되었습니다!")
-                st.rerun()
+
+                if replace:
+                    st.success(f"✅ {len(novel.characters)}명의 등장인물을 새로 추출했습니다!")
+                else:
+                    st.success(f"✅ {newly_added_count}명의 새로운 등장인물을 추가했습니다! (총 {len(novel.characters)}명)")
+                st.rerun() # UI 새로고침
             else:
                 st.error("❌ 등장인물을 추출할 수 없습니다.")
                 
