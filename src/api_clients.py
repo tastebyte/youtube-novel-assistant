@@ -52,7 +52,7 @@ class GeminiClient(SecureAPIClient):
         
         self.base_url = "https://generativelanguage.googleapis.com/v1beta/models"
         # 텍스트 분석 및 생성 모델 업데이트
-        self.text_model = "gemini-2.5-flash-preview-05-20"
+        self.text_model = "gemini-3-pro-preview"
     
     def test_api_connection(self) -> bool:
         """API 연결 테스트"""
